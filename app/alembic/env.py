@@ -16,7 +16,8 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from config import settings
-from models import Base  # noqa: F401 — populates Base.metadata via models/__init__.py
+from database import Base
+import models  # noqa: F401 — importing populates Base.metadata as a side effect
 
 config = context.config
 
