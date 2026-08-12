@@ -24,25 +24,24 @@ data "aws_ami" "al2023" {
 # User data — bootstrap script
 #
 # Responsibilities:
-#  1. Install Python 3.11 + pip + git
+#  1. Install Python 3.11 + pip + git + PostgreSQL client
 #  2. Pull DB connection details from SSM Parameter Store at boot
 #     time (never baked into the AMI or this script as literals)
-#  3. Clone the app repo and install dependencies
-#  4. Run Alembic migrations
-#  5. Start the FastAPI app as a systemd service
-#
-# Kept intentionally simple for the demo — a real deployment would
-# use a pre-baked AMI or container image instead of pulling git +
-# pip install at boot, to avoid boot-time dependency on GitHub/PyPI
-# availability. That tradeoff belongs in the ADR.
+#  3. Clone the app repo (public — see ADR on repo visibility) and
+#     install dependencies into a venv
+#  4. Run Alembic migrations against the live RDS instance
+#  5. Start the FastAPI app as a systemd service, so it survives
+#     reboots and restarts automatically on crash
 #############################################
 
 locals {
+  app_repo_url = "https://github.com/bahasaki/aws-rds-fintech-ledger.git"
+
   app_user_data = <<-EOF
     #!/bin/bash
     set -euxo pipefail
 
-    dnf install -y python3.11 python3.11-pip git
+    dnf install -y python3.11 python3.11-pip git postgresql16
 
     # Pull DB config from SSM at boot — nothing DB-related is hardcoded here.
     SSM_PREFIX="/${var.project_name}/${var.environment}/db"
@@ -52,22 +51,57 @@ locals {
     DB_USER=$(aws ssm get-parameter --name "$SSM_PREFIX/username" --with-decryption --query 'Parameter.Value' --output text --region ${var.aws_region})
     DB_PASS=$(aws ssm get-parameter --name "$SSM_PREFIX/password" --with-decryption --query 'Parameter.Value' --output text --region ${var.aws_region})
 
-    mkdir -p /opt/ledger-app
-    cd /opt/ledger-app
+    rm -rf /opt/ledger-app
+    git clone --depth 1 ${local.app_repo_url} /opt/ledger-app
+    cd /opt/ledger-app/app
 
-    # Values are single-quoted so that shell metacharacters in the
-    # password (parentheses, backticks, dollar signs, etc.) are
-    # treated as literal characters if this file is ever sourced by
-    # a shell, rather than interpreted as shell syntax. See
-    # docs/incidents/incident-004 for the failure this prevents.
+    # NOT single-quoted here — systemd's EnvironmentFile parser has its
+    # own, less predictable quoting rules than a shell (quotes can end
+    # up as literal characters in the value rather than being stripped).
+    # Safety instead comes from restricting the password's character
+    # set at generation time (see rds.tf random_password.db_master) to
+    # exclude shell/parsing metacharacters entirely, rather than trying
+    # to quote around them here. See docs/incidents/incident-005.
     cat > .env <<EOT
-    DATABASE_URL='postgresql://$${DB_USER}:$${DB_PASS}@$${DB_HOST}:$${DB_PORT}/$${DB_NAME}'
+    DATABASE_URL=postgresql://$${DB_USER}:$${DB_PASS}@$${DB_HOST}:$${DB_PORT}/$${DB_NAME}
     EOT
 
-    # NOTE: application code deployment (git clone / pip install / alembic
-    # upgrade / systemd unit) is deliberately left out of this bootstrap —
-    # tracked as the next step once the FastAPI app skeleton exists.
-    echo "Bootstrap complete: DB connection details written to /opt/ledger-app/.env"
+    python3.11 -m venv venv
+    source venv/bin/activate
+    pip install --upgrade pip
+    pip install -r requirements.txt
+
+    # Apply migrations before starting the app — the app assumes the
+    # schema already exists, it does not create tables itself.
+    alembic upgrade head
+
+    deactivate
+
+    # systemd unit — runs the app as a long-lived service that
+    # restarts automatically on crash and starts on boot, rather than
+    # a foreground process tied to this bootstrap script's lifetime.
+    cat > /etc/systemd/system/ledger-app.service <<'EOT'
+    [Unit]
+    Description=Ledger FastAPI app
+    After=network.target
+
+    [Service]
+    Type=simple
+    WorkingDirectory=/opt/ledger-app/app
+    EnvironmentFile=/opt/ledger-app/app/.env
+    ExecStart=/opt/ledger-app/app/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+    Restart=on-failure
+    RestartSec=5
+
+    [Install]
+    WantedBy=multi-user.target
+    EOT
+
+    systemctl daemon-reload
+    systemctl enable ledger-app
+    systemctl start ledger-app
+
+    echo "Bootstrap complete: ledger-app deployed and running on port 8000"
   EOF
 }
 
