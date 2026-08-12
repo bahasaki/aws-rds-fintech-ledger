@@ -25,11 +25,22 @@ def upgrade() -> None:
     )
     account_type.create(op.get_bind())
 
+    # create_type=False here is deliberate: the ENUM was already
+    # created explicitly above. Without it, create_table's own
+    # before_create DDL event tries to create the same type a second
+    # time and fails with DuplicateObject — see docs/incidents/
+    # incident-006 for the failure this caused before this fix.
+    account_type_in_table = postgresql.ENUM(
+        "asset", "liability", "equity", "revenue", "expense",
+        name="account_type",
+        create_type=False,
+    )
+
     op.create_table(
         "accounts",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("name", sa.String(), nullable=False),
-        sa.Column("account_type", account_type, nullable=False),
+        sa.Column("account_type", account_type_in_table, nullable=False),
         sa.Column("currency", sa.String(length=3), nullable=False, server_default="USD"),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
     )
